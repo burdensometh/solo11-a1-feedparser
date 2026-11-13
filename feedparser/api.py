@@ -74,6 +74,7 @@ SUPPORTED_VERSIONS = {
 def _open_resource(
     url_file_stream_or_string,
     result,
+    cached_result=None,
 ):
     """URL, filename, or string --> stream
 
@@ -114,7 +115,7 @@ def _open_resource(
         "https",
     )
     if looks_like_url:
-        data = http.get(url_file_stream_or_string, result)
+        data = http.get(url_file_stream_or_string, result, cached_result=cached_result)
         return io.BytesIO(data)
 
     # try to open with native open function (if url_file_stream_or_string is a filename)
@@ -196,12 +197,19 @@ def parse(
         entries=[],
         feed=FeedParserDict(),
         headers={},
+        from_cache=False,
     )
+
+    # If this URL was requested before, a cached result may hold the
+    # validators needed to make this request conditional.
+    url = _get_url(url_file_stream_or_string)
+    cached_result = http.get_cached_result(url) if url is not None else None
 
     try:
         file = _open_resource(
             url_file_stream_or_string,
             result,
+            cached_result=cached_result,
         )
     except urllib.error.URLError as error:
         result.update(
@@ -211,6 +219,16 @@ def parse(
             }
         )
         return result
+
+    if result["from_cache"] and cached_result is not None and url is not None:
+        # The server said the feed hasn't changed, so return the previously
+        # parsed result instead of parsing content we don't have.
+        if not hasattr(url_file_stream_or_string, "read"):
+            file.close()
+        reused = _reuse_cached_result(cached_result, result, response_headers)
+        # The server may have sent updated validators with the 304 response.
+        http.update_cache(url, reused)
+        return reused
 
     # at this point, the file is guaranteed to be seekable;
     # we read 1 byte/character to see if it's empty and return early
@@ -236,7 +254,44 @@ def parse(
             # the file does not come from the user, close it
             file.close()
 
+    # Remember the result so it can be used the next time this URL
+    # is requested conditionally. Error responses aren't worth caching.
+    if url is not None and result.get("status") == 200:
+        http.update_cache(url, result)
+
     return result
+
+
+def _get_url(url_file_stream_or_string) -> str | None:
+    """Return the input if it is an HTTP(S) URL, else None."""
+    if isinstance(url_file_stream_or_string, str) and urllib.parse.urlparse(
+        url_file_stream_or_string
+    )[0] in ("http", "https"):
+        return url_file_stream_or_string
+    return None
+
+
+def _reuse_cached_result(
+    cached_result, result, response_headers=None
+) -> FeedParserDict:
+    """Return the previous parse result, refreshed with the latest HTTP data."""
+    reused = cached_result
+
+    # A "304 Not Modified" response carries a small set of fresh headers
+    # (and sometimes a new ETag or Last-Modified value), so merge them in.
+    # Headers passed by the caller still take precedence.
+    headers = dict(reused.get("headers", {}))
+    headers.update(result["headers"])
+    headers.update(response_headers or {})
+    reused["headers"] = headers
+
+    for key in ("etag", "modified", "modified_parsed", "href"):
+        if result.get(key):
+            reused[key] = result[key]
+
+    reused["status"] = result["status"]
+    reused["from_cache"] = True
+    return reused
 
 
 def _parse_file_inplace(

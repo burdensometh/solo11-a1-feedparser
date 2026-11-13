@@ -15,6 +15,12 @@ requests.  If the feed has not changed since the last time you requested it,
 the server will return a special :abbr:`HTTP (Hypertext Transfer Protocol)`
 status code (``304``) and no feed data.
 
+feedparser does this automatically.  It remembers the ETag and Last-Modified
+values from each response, sends them back as ``If-None-Match`` and
+``If-Modified-Since`` request headers the next time the same URL is requested,
+and reuses the previously parsed result when the server answers ``304``.
+Reused results are marked with ``from_cache``.
+
 Using ETags to reduce bandwidth
 -------------------------------
 
@@ -24,16 +30,17 @@ Using ETags to reduce bandwidth
     >>> d = feedparser.parse('$READTHEDOCS_CANONICAL_URL/examples/atom10.xml')
     >>> d.etag
     '"6c132-941-ad7e3080"'
-    >>> d2 = feedparser.parse('$READTHEDOCS_CANONICAL_URL/examples/atom10.xml', etag=d.etag)
+    >>> d.from_cache
+    False
+    >>> # The second request is made conditionally, automatically.
+    >>> d2 = feedparser.parse('$READTHEDOCS_CANONICAL_URL/examples/atom10.xml')
     >>> d2.status
     304
-    >>> d2.feed
-    {}
-    >>> d2.entries
-    []
-    >>> d2.debug_message
-    'The feed has not changed since you last checked, so
-    the server sent no data.  This is a feature, not a bug!'
+    >>> d2.from_cache
+    True
+    >>> # The previously parsed feed is returned instead of being parsed again.
+    >>> d2.feed.title
+    'Sample Feed'
 
 There is a related concept which accomplishes the same thing, but slightly
 differently.  In this case, the server publishes the last-modified date of the
@@ -54,16 +61,11 @@ Using Last-Modified headers to reduce bandwidth
     Fri, 11 Jun 2012 23:00:34 GMT
     >>> d.modified_parsed
     (2004, 6, 11, 23, 0, 34, 4, 163, 0)
-    >>> d2 = feedparser.parse('$READTHEDOCS_CANONICAL_URL/examples/atom10.xml', modified=d.modified)
+    >>> d2 = feedparser.parse('$READTHEDOCS_CANONICAL_URL/examples/atom10.xml')
     >>> d2.status
     304
-    >>> d2.feed
-    {}
-    >>> d2.entries
-    []
-    >>> d2.debug_message
-    'The feed has not changed since you last checked, so
-    the server sent no data.  This is a feature, not a bug!'
+    >>> d2.from_cache
+    True
 
 Clients should support both ETag and Last-Modified headers, as some servers support one but not the other.
 
@@ -78,12 +80,15 @@ Clients should support both ETag and Last-Modified headers, as some servers supp
 
 .. note::
 
-    You can control the behaviour of :abbr:`HTTP (Hypertext Transfer Protocol)`
-    caches between your application and the origin server by using the
-    ``request_headers`` parameter.  For example, you may want to send
-    ``Cache-control: max-age=60`` to make the caches revalidate against the
-    origin server unless their cached copy is less than a minute old.  Again,
-    this should be used with consideration.
+    Conditional requests are made automatically when feedparser knows
+    the ETag or Last-Modified value from a previous response for the same URL.
+    Validators are stored in the result dictionary, and recent results
+    (up to ``feedparser.http.CACHE_MAX_SIZE`` URLs) are kept so a ``304``
+    response can be answered with the previously parsed feed.
+
+    To avoid a conditional request for a URL, use an HTTP client like
+    the ``requests`` package to request the URL yourself and pass
+    the content to :func:`feedparser.parse`.
 
 
 .. seealso::
