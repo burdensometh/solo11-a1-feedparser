@@ -2,8 +2,8 @@
 <!--
 SkipUnless:  __import__('codecs').lookup('iso-8859-7')
 Header:      Content-type: text/xml
-Description: non-ASCII characters in date crashes parser
-Expect:      1
+Description: non-ASCII characters in a date do not crash the parser
+Expect:      not bozo and feed.published_parsed == (2004, 6, 29, 12, 53, 0, 1, 181, 0)
 -->
 <rss version="2.0">
 	<channel>

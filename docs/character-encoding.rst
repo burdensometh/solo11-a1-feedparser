@@ -71,33 +71,49 @@ declaration within the document is ignored completely, and the encoding is
 
 #. us-ascii.
 
+..  note::
+
+    :program:`Universal Feed Parser` does not follow the :abbr:`RFC (Request For Comments)` 3023 ordering shown above.
+    See :ref:`advanced.encoding.incorrect` for the ordering it does use.
+
+
+.. _advanced.encoding.incorrect:
 
 Handling Incorrectly-Declared Encodings
 ---------------------------------------
 
-:program:`Universal Feed Parser` initially uses the rules specified in
-:abbr:`RFC (Request For Comments)` 3023 to determine the character encoding of
-the feed.  If parsing succeeds, then that's that.  If parsing fails,
-:program:`Universal Feed Parser` sets the ``bozo`` bit to ``1`` and sets
-``bozo_exception`` to ``feedparser.CharacterEncodingOverride``.  Then it tries
-to reparse the feed with the following character encodings:
+:program:`Universal Feed Parser` determines the character encoding in a fixed
+order of precedence:
 
+#. the byte order mark (BOM) at the start of the document,
 
-#. the encoding specified in the :abbr:`XML (Extensible Markup Language)` declaration
+#. the encoding named in the encoding attribute of the :abbr:`XML (Extensible Markup Language)` declaration,
 
-#. the encoding sniffed from the first four bytes of the document (as per `Section F <http://www.w3.org/TR/REC-xml/#sec-guessing-no-ext-info>`_)
+#. the encoding given in the ``charset`` parameter of the Content-Type :abbr:`HTTP (Hypertext Transfer Protocol)` header.
 
-#. the encoding auto-detected by the `chardet <https://github.com/chardet/chardet>`_, if installed
+The first of these sources that declares an encoding wins. When they
+disagree, the conflict is recorded: the ``bozo`` bit is set to ``1`` and
+``bozo_exception`` is set to ``feedparser.CharacterEncodingOverride``, whose
+message names the conflicting sources. This fixed ordering deliberately
+departs from :abbr:`RFC (Request For Comments)` 3023, in which the
+Content-Type ``charset`` parameter overrides the :abbr:`XML (Extensible Markup Language)`
+declaration for text/xml media types. In practice many feeds declare their
+encoding correctly in the document while the server sends a generic or
+incorrect Content-Type. :abbr:`RFC (Request For Comments)` 7303, which
+supersedes :abbr:`RFC (Request For Comments)` 3023, likewise gives the byte
+order mark precedence.
 
-#. utf-8
+If none of the sources declares an encoding, or if the declared encodings
+cannot decode the document, the encoding is auto-detected. Detection uses
+`chardet <https://github.com/chardet/chardet>`_ if it is installed, and
+`charset-normalizer <https://github.com/jawah/charset_normalizer>`_ otherwise.
+When :program:`Universal Feed Parser` has to use an encoding other than the
+declared one, it sets the ``bozo`` bit to ``1`` and sets ``bozo_exception``
+to ``feedparser.CharacterEncodingOverride``.
 
-#. windows-1252
-
-
-If the character encoding can not be determined, :program:`Universal Feed Parser`
-sets the ``bozo`` bit to ``1`` and sets ``bozo_exception`` to
-``feedparser.CharacterEncodingUnknown``.  In this case, parsed values will be
-strings, not Unicode strings.
+As a last resort, the document is decoded as utf-8 and any invalid bytes are
+replaced with ``�`` (U+FFFD). In this case the ``bozo`` bit is set to ``1``
+and ``bozo_exception`` is set to ``feedparser.CharacterEncodingUnknown``.
 
 
 Handling Incorrectly-Declared Media Types

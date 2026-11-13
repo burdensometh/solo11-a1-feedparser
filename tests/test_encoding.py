@@ -5,6 +5,7 @@ import os
 import pytest
 
 import feedparser
+import feedparser.encodings
 
 from .helpers import (
     fail_unless_eval,
@@ -43,6 +44,166 @@ def test_gb2312_converted_to_gb18030_in_xml_encoding():
         feed.encode("gb18030"), response_headers={"Content-Type": "text/xml"}
     )
     assert result.encoding == "gb18030"
+
+
+CJK_FEED = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<rss version="2.0"><channel>'
+    "<title>\u4e2d\u6587\u6807\u9898</title>"
+    "<description>\u8fd9\u662f\u4e00\u4e2a\u6d4b\u8bd5\u8ba2\u9605\u6e90\uff0c"
+    "\u5305\u542b\u8db3\u591f\u7684\u4e2d\u6587\u5185\u5bb9\u4ee5\u4fbf\u7f16\u7801"
+    "\u68c0\u6d4b\u5668\u8bc6\u522b\u3002</description>"
+    "</channel></rss>"
+)
+
+
+@pytest.mark.parametrize(
+    "response_headers",
+    (
+        {},
+        {"Content-Type": "application/rss+xml"},
+        {"Content-Type": "application/rss+xml; charset=utf-8"},
+        {"Content-Type": "text/xml"},
+        {"Content-Type": "text/xml; charset=utf-8"},
+    ),
+)
+def test_gbk_declared_as_utf8_is_detected(response_headers):
+    """A GBK document that claims to be UTF-8 must not stay mojibake.
+
+    The declared encoding cannot decode the data, so the encoding is
+    detected instead of falling back to a single-byte encoding such as
+    windows-1252 that decodes anything.
+    """
+    result = feedparser.parse(CJK_FEED.encode("gbk"), response_headers=response_headers)
+
+    assert result["feed"]["title"] == "\u4e2d\u6587\u6807\u9898"
+    assert result["feed"]["description"].startswith(
+        "\u8fd9\u662f\u4e00\u4e2a\u6d4b\u8bd5\u8ba2\u9605\u6e90"
+    )
+    # Different detectors name the same encoding differently.
+    assert result.encoding.lower() in {"gb18030", "gbk", "gb2312"}
+    # The declared encoding was wrong, so this is reported.
+    assert result.bozo is True
+    assert isinstance(result.bozo_exception, feedparser.CharacterEncodingOverride)
+
+
+@pytest.mark.parametrize(
+    "bom, encoding",
+    (
+        (codecs.BOM_UTF8, "utf-8"),
+        (codecs.BOM_UTF16_LE, "utf-16le"),
+        (codecs.BOM_UTF16_BE, "utf-16be"),
+        (codecs.BOM_UTF32_LE, "utf-32le"),
+        (codecs.BOM_UTF32_BE, "utf-32be"),
+    ),
+)
+@pytest.mark.parametrize(
+    "response_headers",
+    ({}, {"Content-Type": "text/xml"}, {"Content-Type": "application/rss+xml"}),
+)
+def test_bom_without_declaration(bom, encoding, response_headers):
+    """A BOM is honored, and the BOM never leaks into the parsed values."""
+    feed = (
+        '<rss version="2.0">'
+        "<channel><title>\u4e2d\u6587\u6807\u9898</title></channel></rss>"
+    )
+    data = bom + feed.encode(encoding)
+
+    result = feedparser.parse(data, response_headers=response_headers)
+
+    assert result["feed"]["title"] == "\u4e2d\u6587\u6807\u9898"
+    assert not result["feed"]["title"].startswith("\ufeff")
+    assert result.encoding == encoding
+    # With no other declaration there is nothing to conflict with.
+    assert result.bozo is False
+
+
+def test_bom_takes_precedence_over_xml_declaration():
+    feed = '<rss version="2.0"><channel><title>caf\u00e9</title></channel></rss>'
+    data = codecs.BOM_UTF8 + feed.encode("utf-8")
+
+    result = feedparser.parse(
+        data,
+        response_headers={"Content-Type": "application/rss+xml; charset=iso-8859-1"},
+    )
+
+    assert result["feed"]["title"] == "caf\u00e9"
+    assert result.encoding == "utf-8"
+    assert result.bozo is True
+    assert isinstance(result.bozo_exception, feedparser.CharacterEncodingOverride)
+    assert "byte order mark" in str(result.bozo_exception)
+
+
+def test_xml_declaration_takes_precedence_over_http_header():
+    feed = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<rss version="2.0"><channel><title>caf\u00e9</title></channel></rss>'
+    )
+
+    result = feedparser.parse(
+        feed.encode("utf-8"),
+        response_headers={"Content-Type": "text/xml; charset=iso-8859-1"},
+    )
+
+    assert result["feed"]["title"] == "caf\u00e9"
+    assert result.encoding == "utf-8"
+    assert result.bozo is True
+    assert isinstance(result.bozo_exception, feedparser.CharacterEncodingOverride)
+    assert "XML declaration" in str(result.bozo_exception)
+
+
+def test_http_charset_used_when_nothing_else_is_declared():
+    feed = '<rss version="2.0"><channel><title>caf\u00e9</title></channel></rss>'
+
+    result = feedparser.parse(
+        feed.encode("iso-8859-1"),
+        response_headers={"Content-Type": "application/rss+xml; charset=iso-8859-1"},
+    )
+
+    assert result["feed"]["title"] == "caf\u00e9"
+    assert result.encoding == "iso-8859-1"
+    assert result.bozo is False
+
+
+def test_conflicting_declarations_are_reported_as_warning():
+    """Conflicts win by precedence and are reported via bozo_exception."""
+    feed = (
+        '<?xml version="1.0" encoding="iso-8859-1"?>'
+        '<rss version="2.0"><channel><title>caf\u00e9</title></channel></rss>'
+    )
+
+    result = feedparser.parse(
+        feed.encode("iso-8859-1"),
+        response_headers={"Content-Type": "application/rss+xml; charset=utf-8"},
+    )
+
+    assert result["feed"]["title"] == "caf\u00e9"
+    assert result.encoding == "iso-8859-1"
+    assert result.bozo is True
+    exception_text = str(result.bozo_exception)
+    assert "conflicting encodings" in exception_text
+    assert "iso-8859-1" in exception_text
+    assert "utf-8" in exception_text
+
+
+def test_undetectable_data_falls_back_to_utf8_with_replacement(monkeypatch):
+    """If no detector can decode the data, replace the bad bytes as utf-8."""
+    # Disable the optional detectors so the fallback is reached. A detector
+    # can decode almost anything because single-byte encodings accept every
+    # byte, so this path is otherwise unreachable.
+    monkeypatch.setattr(feedparser.encodings, "lazy_encoding_detectors", [])
+
+    data = (
+        b'<rss version="2.0"><channel>'
+        b"<title>bad \xff\xfe bytes</title></channel></rss>"
+    )
+
+    result = feedparser.parse(data, response_headers={"Content-Type": "text/xml"})
+
+    assert result.encoding == "utf-8"
+    assert "\ufffd" in result["feed"]["title"]
+    assert result.bozo is True
+    assert isinstance(result.bozo_exception, feedparser.CharacterEncodingUnknown)
 
 
 @pytest.mark.parametrize("file", local_files)

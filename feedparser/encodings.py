@@ -33,20 +33,45 @@ import io
 import re
 import typing
 
+
+# Encoding detectors are optional. chardet is preferred when installed so
+# that its encoding names and results stay stable, then charset-normalizer
+# (a dependency of requests) is used as a fallback.
+lazy_encoding_detectors: list[typing.Callable[[bytes], str]] = []
+
 try:
     try:
         import cchardet as chardet  # type: ignore[import]
     except ImportError:
         import chardet  # type: ignore[no-redef]
 except ImportError:
-    lazy_chardet_encoding = None
+    pass
 else:
 
-    def lazy_chardet_encoding(data):
+    def lazy_chardet_encoding(data: bytes) -> str:
         return chardet.detect(data)["encoding"] or ""
 
+    lazy_encoding_detectors.append(lazy_chardet_encoding)
 
-from .exceptions import (
+try:
+    import charset_normalizer as _charset_normalizer
+except ImportError:
+    pass
+else:
+
+    def lazy_charset_normalizer_encoding(data: bytes) -> str:
+        try:
+            best_match = _charset_normalizer.from_bytes(data).best()
+        except Exception:  # noqa: BLE001 - detectors can fail on odd input
+            return ""
+        if best_match is None:
+            return ""
+        return best_match.encoding or ""
+
+    lazy_encoding_detectors.append(lazy_charset_normalizer_encoding)
+
+
+from .exceptions import (  # noqa: E402 - the detectors are independent
     CharacterEncodingOverride,
     CharacterEncodingUnknown,
     FeedparserError,
@@ -96,100 +121,119 @@ def parse_content_type(line: str) -> tuple[str, str]:
     return mime_type, charset_value
 
 
+def _get_header(http_headers: dict[str, str], name: str) -> str:
+    """Look up an HTTP header by name, ignoring case."""
+    value = http_headers.get(name)
+    if value is not None:
+        return value
+    for header_name, header_value in http_headers.items():
+        if header_name.lower() == name:
+            return header_value
+    return ""
+
+
+def _detect_bom(data: bytes) -> tuple[str, bytes]:
+    """Return the encoding named by a BOM and the data after the BOM."""
+    if data[:4] == codecs.BOM_UTF32_BE:
+        return "utf-32be", data[4:]
+    if data[:4] == codecs.BOM_UTF32_LE:
+        return "utf-32le", data[4:]
+    if data[:2] == codecs.BOM_UTF16_BE and data[2:4] != ZERO_BYTES:
+        return "utf-16be", data[2:]
+    if data[:2] == codecs.BOM_UTF16_LE and data[2:4] != ZERO_BYTES:
+        return "utf-16le", data[2:]
+    if data[:3] == codecs.BOM_UTF8:
+        return "utf-8", data[3:]
+    return "", data
+
+
 def convert_to_utf8(
-    http_headers: dict[str, str], data: bytes, result: dict[str, typing.Any]
+    http_headers: dict[str, str],
+    data: bytes,
+    result: dict[str, typing.Any],
 ) -> bytes:
-    """Detect and convert the character encoding to UTF-8."""
+    """Detect and convert the character encoding to UTF-8.
+
+    The encoding is determined in a fixed order of precedence:
+
+    #. the byte order mark (BOM) at the start of the document,
+    #. the encoding named in the XML declaration,
+    #. the ``charset`` parameter of the HTTP Content-Type header.
+
+    The first of these sources that is present wins. When they disagree,
+    the earliest source still wins, and the conflict is recorded: the
+    ``bozo`` bit is set and ``bozo_exception`` is a
+    :class:`~feedparser.exceptions.CharacterEncodingOverride` that names
+    the conflicting sources.
+
+    If no source names the encoding, or if the named encodings cannot
+    decode the data, the encoding is auto-detected. If the data still
+    cannot be decoded, it is decoded as UTF-8 and the invalid bytes are
+    replaced.
+
+    """
 
     # This is so much trickier than it sounds, it's not even funny.
-    # According to RFC 3023 ('XML Media Types'), if the HTTP Content-Type
-    # is application/xml, application/*+xml,
-    # application/xml-external-parsed-entity, or application/xml-dtd,
-    # the encoding given in the charset parameter of the HTTP Content-Type
-    # takes precedence over the encoding given in the XML prefix within the
-    # document, and defaults to 'utf-8' if neither are specified.  But, if
-    # the HTTP Content-Type is text/xml, text/*+xml, or
-    # text/xml-external-parsed-entity, the encoding given in the XML prefix
-    # within the document is ALWAYS IGNORED and only the encoding given in
-    # the charset parameter of the HTTP Content-Type header should be
-    # respected, and it defaults to 'us-ascii' if not specified.
+    #
+    # RFC 3023 lets the HTTP charset override the XML declaration for
+    # text/xml media types, and lets the XML declaration override the
+    # charset for application/*+xml media types. In practice that ordering
+    # garbles feeds that declare one encoding in the body while the server
+    # sends another in the header. RFC 7303, which supersedes RFC 3023,
+    # also gives the BOM precedence over the charset parameter. The
+    # precedence used here is fixed instead: BOM, then XML declaration,
+    # then HTTP header.
 
-    # Furthermore, discussion on the atom-syntax mailing list with the
-    # author of RFC 3023 leads me to the conclusion that any document
-    # served with a Content-Type of text/* and no charset parameter
-    # must be treated as us-ascii.  (We now do this.)  And also that it
-    # must always be flagged as non-well-formed.  (We now do this too.)
+    # Check for BOMs first, and remove the BOM bytes from the data.
+    bom_encoding, data = _detect_bom(data)
 
-    # If Content-Type is unspecified (input was local file or non-HTTP source)
-    # or unrecognized (server just got it totally wrong), then go by the
-    # encoding given in the XML prefix of the document and default to
-    # 'iso-8859-1' as per the HTTP specification (RFC 2616).
+    # Check for the characters '<?xm' in several encodings. These are not
+    # BOMs, so the data is left untouched. The information is only used to
+    # read the XML declaration; it never outranks a declared encoding.
+    sniffed_encoding = ""
+    if not bom_encoding:
+        if data[:4] == EBCDIC_MARKER:
+            sniffed_encoding = "cp037"
+        elif data[:4] == UTF16BE_MARKER:
+            sniffed_encoding = "utf-16be"
+        elif data[:4] == UTF16LE_MARKER:
+            sniffed_encoding = "utf-16le"
+        elif data[:4] == UTF32BE_MARKER:
+            sniffed_encoding = "utf-32be"
+        elif data[:4] == UTF32LE_MARKER:
+            sniffed_encoding = "utf-32le"
 
-    # Then, assuming we didn't find a character encoding in the HTTP headers
-    # (and the HTTP Content-type allowed us to look in the body), we need
-    # to sniff the first few bytes of the XML data and try to determine
-    # whether the encoding is ASCII-compatible.  Section F of the XML
-    # specification shows the way here:
-    # http://www.w3.org/TR/REC-xml/#sec-guessing-no-ext-info
+    # Broken feeds may start with whitespace before the BOM or the XML
+    # declaration. Strip it, then look for a BOM again. This is only done
+    # for ASCII-compatible encodings: in UTF-16 and UTF-32 a single
+    # character spans several bytes that are not ASCII.
+    ascii_compatible = bom_encoding in ("", "utf-8") and sniffed_encoding == ""
+    if ascii_compatible:
+        stripped = data.lstrip(b" \t\r\n")
+        if len(stripped) != len(data):
+            data = stripped
+            if not bom_encoding:
+                bom_encoding, data = _detect_bom(data)
 
-    # If the sniffed encoding is not ASCII-compatible, we need to make it
-    # ASCII compatible so that we can sniff further into the XML declaration
-    # to find the encoding attribute, which will tell us the true encoding.
-
-    # Of course, none of this guarantees that we will be able to parse the
-    # feed in the declared character encoding (assuming it was declared
-    # correctly, which many are not).
-
-    bom_encoding = ""
-    xml_encoding = ""
-
-    # Look at the first few bytes of the document to guess what
-    # its encoding may be. We only need to decode enough of the
-    # document that we can use an ASCII-compatible regular
-    # expression to search for an XML encoding declaration.
-    # The heuristic follows the XML specification, section F:
-    # http://www.w3.org/TR/REC-xml/#sec-guessing-no-ext-info
-    # Check for BOMs first.
-    if data[:4] == codecs.BOM_UTF32_BE:
-        bom_encoding = "utf-32be"
-        data = data[4:]
-    elif data[:4] == codecs.BOM_UTF32_LE:
-        bom_encoding = "utf-32le"
-        data = data[4:]
-    elif data[:2] == codecs.BOM_UTF16_BE and data[2:4] != ZERO_BYTES:
-        bom_encoding = "utf-16be"
-        data = data[2:]
-    elif data[:2] == codecs.BOM_UTF16_LE and data[2:4] != ZERO_BYTES:
-        bom_encoding = "utf-16le"
-        data = data[2:]
-    elif data[:3] == codecs.BOM_UTF8:
-        bom_encoding = "utf-8"
-        data = data[3:]
-    # Check for the characters '<?xm' in several encodings.
-    elif data[:4] == EBCDIC_MARKER:
-        bom_encoding = "cp037"
-    elif data[:4] == UTF16BE_MARKER:
-        bom_encoding = "utf-16be"
-    elif data[:4] == UTF16LE_MARKER:
-        bom_encoding = "utf-16le"
-    elif data[:4] == UTF32BE_MARKER:
-        bom_encoding = "utf-32be"
-    elif data[:4] == UTF32LE_MARKER:
-        bom_encoding = "utf-32le"
-
+    # Capture the encoding named in the XML declaration. Decode enough of
+    # the document with the encoding identified above to be able to use an
+    # ASCII-compatible regular expression on it.
     tempdata = data
     try:
         if bom_encoding:
             tempdata = data.decode(bom_encoding).encode("utf-8")
+        elif sniffed_encoding:
+            tempdata = data.decode(sniffed_encoding).encode("utf-8")
     except UnicodeDecodeError:
         xml_encoding_match = None
     else:
         xml_encoding_match = RE_XML_PI_ENCODING.match(tempdata)
 
+    xml_encoding = ""
     if xml_encoding_match:
         xml_encoding = xml_encoding_match.groups()[0].decode("utf-8").lower()
         # Normalize the xml_encoding if necessary.
-        if bom_encoding and (
+        if (bom_encoding or sniffed_encoding) and (
             xml_encoding
             in (
                 "u16",
@@ -208,15 +252,16 @@ def convert_to_utf8(
                 "ucs-4",
             )
         ):
-            xml_encoding = bom_encoding
+            xml_encoding = bom_encoding or sniffed_encoding
 
-    # Find the HTTP Content-Type and, hopefully, a character
-    # encoding provided by the server. The Content-Type is used
-    # to choose the "correct" encoding among the BOM encoding,
-    # XML declaration encoding, and HTTP encoding, following the
-    # heuristic defined in RFC 3023.
-    http_content_type = http_headers.get("content-type") or ""
-    http_content_type, http_encoding = parse_content_type(http_content_type)
+    # Find the HTTP Content-Type and, hopefully, a character encoding
+    # provided by the server. Only an explicit "charset" parameter declares
+    # an encoding; the default implied by the media type is only used to
+    # decode the data when no source declares an encoding.
+    # Header names are case-insensitive, and the headers may not have been
+    # lowercased already (for example, when passed by the caller).
+    content_type_header = _get_header(http_headers, "content-type")
+    http_content_type, http_encoding = parse_content_type(content_type_header)
 
     acceptable_content_type = 0
     application_content_types = (
@@ -232,106 +277,245 @@ def convert_to_utf8(
         and http_content_type.endswith("+xml")
     ):
         acceptable_content_type = 1
-        rfc3023_encoding = http_encoding or xml_encoding or "utf-8"
+        default_encoding = "utf-8"
     elif http_content_type in text_content_types or (
         http_content_type.startswith("text/") and http_content_type.endswith("+xml")
     ):
         acceptable_content_type = 1
-        rfc3023_encoding = http_encoding or "us-ascii"
+        default_encoding = "us-ascii"
     elif http_content_type in json_content_types or (
         not http_content_type and data and data.lstrip().startswith(b"{")
     ):
         http_content_type = json_content_types[0]
         acceptable_content_type = 1
         json = True
-        rfc3023_encoding = http_encoding or "utf-8"  # RFC 7159, 8.1.
+        default_encoding = "utf-8"  # RFC 7159, 8.1.
     elif http_content_type.startswith("text/"):
-        rfc3023_encoding = http_encoding or "us-ascii"
-    elif http_headers and "content-type" not in http_headers:
-        rfc3023_encoding = xml_encoding or "iso-8859-1"
+        default_encoding = "us-ascii"
+    elif http_headers and not _get_header(http_headers, "content-type"):
+        default_encoding = "iso-8859-1"
     else:
-        rfc3023_encoding = xml_encoding or "utf-8"
-    # gb18030 is a superset of gb2312, so always replace gb2312
-    # with gb18030 for greater compatibility.
-    if rfc3023_encoding.lower() == "gb2312":
-        rfc3023_encoding = "gb18030"
-    if xml_encoding.lower() == "gb2312":
-        xml_encoding = "gb18030"
+        default_encoding = "utf-8"
 
-    # there are four encodings to keep track of:
-    # - http_encoding is the encoding declared in the Content-Type HTTP header
-    # - xml_encoding is the encoding declared in the <?xml declaration
-    # - bom_encoding is the encoding sniffed from the first 4 bytes of the XML data
-    # - rfc3023_encoding is the actual encoding, as per RFC 3023
-    #   and a variety of other conflicting specifications
+    # gb18030 is a superset of gb2312 and gbk, so always replace them
+    # with gb18030 for greater compatibility.
+    if default_encoding.lower() in ("gb2312", "gbk"):
+        default_encoding = "gb18030"
+    if xml_encoding.lower() in ("gb2312", "gbk"):
+        xml_encoding = "gb18030"
+    if http_encoding.lower() in ("gb2312", "gbk"):
+        http_encoding = "gb18030"
+
     error: FeedparserError | None = None
 
     if http_headers and (not acceptable_content_type):
-        if "content-type" in http_headers:
-            msg = "%s is not an accepted media type" % http_headers["content-type"]
+        if _get_header(http_headers, "content-type"):
+            msg = "%s is not an accepted media type" % content_type_header
         else:
             msg = "no Content-type specified"
         error = NonXMLContentType(msg)
 
-    # determine character encoding
-    known_encoding = False
-    tried_encodings = []
-    # try: HTTP encoding, declared XML encoding, encoding sniffed from BOM
-    for encoding_to_try in (
-        rfc3023_encoding,
-        xml_encoding,
-        bom_encoding,
-        lazy_chardet_encoding,
-        "utf-8",
-        "windows-1252",
-        "iso-8859-2",
-    ):
-        if callable(encoding_to_try):
-            proposed_encoding = encoding_to_try(data)
-        else:
-            proposed_encoding = encoding_to_try
-        if not proposed_encoding:
-            continue
-        if proposed_encoding in tried_encodings:
-            continue
-        tried_encodings.append(proposed_encoding)
+    # The order of this tuple defines the precedence: the BOM first, then
+    # the XML declaration, then the HTTP Content-Type header.
+    declared_sources = tuple(
+        (source, encoding)
+        for source, encoding in (
+            ("byte order mark", bom_encoding),
+            ("XML declaration", xml_encoding),
+            ("HTTP Content-Type header", http_encoding),
+        )
+        if encoding
+    )
+    declared_encoding = declared_sources[0][1] if declared_sources else ""
+
+    # Try the declared encodings in precedence order. If nothing declares an
+    # encoding, or the declared encoding cannot decode the data, detect the
+    # encoding. The media type's default encoding is a last resort before
+    # falling back to utf-8 with replacement: it accepts almost any byte
+    # sequence, so it must not be used while detection may still succeed.
+    decoded_encoding = ""
+    text = ""
+    tried_encodings: list[str] = []
+
+    def try_encoding(proposed_encoding: str) -> bool:
+        nonlocal text, decoded_encoding
+        normalized = _normalize_encoding_name(proposed_encoding)
+        if normalized in tried_encodings:
+            return False
+        tried_encodings.append(normalized)
         try:
             text = data.decode(proposed_encoding)
         except (UnicodeDecodeError, LookupError):
-            continue
+            return False
+        decoded_encoding = proposed_encoding
+        return True
 
-        known_encoding = True
-        if not json:
-            # Update the encoding in the opening XML processing instruction.
-            new_declaration = """<?xml version='1.0' encoding='utf-8'?>"""
-            if RE_XML_DECLARATION.search(text):
-                text = RE_XML_DECLARATION.sub(new_declaration, text)
-            else:
-                text = new_declaration + "\n" + text
-        data = text.encode("utf-8")
-        break
+    for _, encoding in declared_sources:
+        if try_encoding(encoding):
+            break
 
-    # if still no luck, give up
-    if not known_encoding:
-        error = CharacterEncodingUnknown(
-            "document encoding unknown, I tried "
-            + "%s, %s, utf-8, windows-1252, and iso-8859-2 but nothing worked"
-            % (rfc3023_encoding, xml_encoding)
-        )
-        rfc3023_encoding = ""
-    elif proposed_encoding != rfc3023_encoding:
-        error = CharacterEncodingOverride(
-            "document declared as %s, but parsed as %s"
-            % (rfc3023_encoding, proposed_encoding)
-        )
-        rfc3023_encoding = proposed_encoding
+    if not decoded_encoding and any(
+        not _encoding_names_differ(encoding, "utf-8")
+        for _, encoding in declared_sources
+    ):
+        # The document says it is utf-8 but contains invalid bytes. If only a
+        # small share of the non-ASCII bytes are invalid, the declared
+        # encoding is probably right and the bad bytes are replaced; this
+        # keeps the rest of the document readable. If most of the non-ASCII
+        # bytes are invalid, the declaration is probably wrong (for example,
+        # a GBK document that claims to be utf-8), and detection is used.
+        replaced_text = data.decode("utf-8", errors="replace")
+        invalid_count = replaced_text.count("�")
+        non_ascii_count = sum(byte > 0x7F for byte in data)
+        if invalid_count <= max(1, non_ascii_count // 4):
+            decoded_encoding = "utf-8"
+            text = replaced_text
+            error = CharacterEncodingOverride(
+                "document declared as utf-8, but contains invalid bytes; "
+                "decoded as utf-8 and replaced them"
+            )
+
+    if not decoded_encoding:
+        # When the document is plain ASCII, every ASCII-compatible encoding
+        # decodes it identically; report the media type's default encoding
+        # rather than the detector's name for ASCII, to match the default
+        # implied by the media type.
+        if all(byte < 0x80 for byte in data):
+            try_encoding(default_encoding)
+
+    if not decoded_encoding and not declared_sources:
+        # Nothing declares an encoding. A strict utf-8 decode is a strong
+        # signal that the document is utf-8; prefer it over detectors,
+        # which can misidentify utf-8 text as a legacy encoding.
+        try_encoding("utf-8")
+
+    if not decoded_encoding and sniffed_encoding:
+        try_encoding(sniffed_encoding)
+
+    if not decoded_encoding:
+        for detect_encoding in lazy_encoding_detectors:
+            detected_encoding = detect_encoding(data)
+            if detected_encoding and try_encoding(detected_encoding):
+                break
+
+    if not decoded_encoding:
+        try_encoding(default_encoding)
+
+    if not decoded_encoding:
+        # Nothing could decode the data. Decode as UTF-8 and replace the
+        # invalid bytes; this always succeeds.
+        decoded_encoding = "utf-8"
+        text = data.decode("utf-8", errors="replace")
+        if error is None:
+            error = CharacterEncodingUnknown(
+                "document encoding unknown, and auto-detection failed; "
+                "decoded as utf-8 and replaced invalid bytes"
+            )
+
+    if not json:
+        text = _replace_xml_declaration(text)
+
+    # Drop any leading byte order mark that survived decoding, for example
+    # when text input starts with U+FEFF. This keeps a stray character out
+    # of the parsed values.
+    text = text.lstrip("﻿")
+
+    data = text.encode("utf-8")
+
+    if error is None:
+        declared_encoding = declared_sources[0][1] if declared_sources else ""
+        conflict = _describe_encoding_conflict(declared_sources, decoded_encoding)
+        if declared_encoding and _encoding_names_differ(
+            decoded_encoding, declared_encoding
+        ):
+            # The highest-precedence declared encoding could not decode the
+            # data, so a lower-precedence source (or detection) was used.
+            error = CharacterEncodingOverride(
+                conflict
+                or "document declared as %s, but parsed as %s"
+                % (declared_encoding, decoded_encoding)
+            )
+        elif conflict:
+            # The declared sources disagree, but the winning one was used.
+            error = CharacterEncodingOverride(conflict)
+        elif not declared_encoding and _encoding_names_differ(
+            decoded_encoding, default_encoding
+        ):
+            # No encoding was declared, so the encoding implied by the
+            # media type was expected, but it could not decode the data.
+            error = CharacterEncodingOverride(
+                "document declared as %s, but parsed as %s"
+                % (default_encoding, decoded_encoding)
+            )
 
     result["content-type"] = http_content_type  # for selecting the parser
-    result["encoding"] = rfc3023_encoding
+    result["encoding"] = decoded_encoding
     if error:
         result["bozo"] = True
         result["bozo_exception"] = error
     return data
+
+
+def _replace_xml_declaration(text: str) -> str:
+    """Rewrite the XML declaration to say the text is now utf-8."""
+    new_declaration = """<?xml version='1.0' encoding='utf-8'?>"""
+    if RE_XML_DECLARATION.search(text):
+        return RE_XML_DECLARATION.sub(new_declaration, text)
+    return new_declaration + "\n" + text
+
+
+def _normalize_encoding_name(encoding: str) -> str:
+    """Return a canonical codec name, for comparing encodings."""
+    try:
+        name = codecs.lookup(encoding).name
+    except LookupError:
+        return encoding.lower()
+    # gb18030 is a superset of these encodings and is used in their place.
+    if name in ("gb2312", "gbk"):
+        return "gb18030"
+    return name
+
+
+def _encoding_names_differ(first: str, second: str) -> bool:
+    return _normalize_encoding_name(first) != _normalize_encoding_name(second)
+
+
+def _describe_encoding_conflict(
+    declared_sources: typing.Sequence[tuple[str, str]],
+    decoded_encoding: str,
+) -> str:
+    """Describe declared sources that disagree, and the outcome."""
+    if len(declared_sources) < 2:
+        return ""
+    winner_source, winner_encoding = declared_sources[0]
+    differing = [
+        "%s (%s)" % (encoding, source)
+        for source, encoding in declared_sources[1:]
+        if _encoding_names_differ(encoding, winner_encoding)
+    ]
+    if not differing:
+        return ""
+    if _encoding_names_differ(decoded_encoding, winner_encoding):
+        # The highest-precedence declaration could not decode the document,
+        # so a lower-precedence one was used.
+        return (
+            "document declares conflicting encodings: %s; parsed as %s "
+            "instead of %s from the %s"
+            % (
+                ", ".join(
+                    "%s (%s)" % (encoding, source)
+                    for source, encoding in declared_sources
+                ),
+                decoded_encoding,
+                winner_encoding,
+                winner_source,
+            )
+        )
+    return (
+        "document declares conflicting encodings; using %s from the %s, "
+        "which takes precedence over %s"
+        % (winner_encoding, winner_source, ", ".join(differing))
+    )
 
 
 # How much to read from a binary file in order to detect encoding.
@@ -389,6 +573,13 @@ def convert_file_to_utf8(
         result["encoding"] = "utf-8"
         return StreamFactory(prefix, file, "utf-8")
 
+    # Remember where the file starts so the raw content can be re-read
+    # if the encoding detected from the prefix fails for the rest of it.
+    try:
+        initial_offset: int | None = file.tell()
+    except (OSError, AttributeError):
+        initial_offset = None
+
     if optimistic_encoding_detection:
         prefix = convert_file_prefix_to_utf8(http_headers, file, result)
         factory = StreamFactory(prefix, file, result.get("encoding"))
@@ -409,8 +600,16 @@ def convert_file_to_utf8(
             while text_file.read(CONVERT_FILE_TEST_CHUNK_LEN):
                 pass
         except UnicodeDecodeError:
-            # fall back to convert_to_utf8()
-            file = factory.get_binary_file()
+            # Fall back to convert_to_utf8() on the original bytes.
+            # The prefix returned by convert_file_prefix_to_utf8() has
+            # already been converted to utf-8, so it must not be reused.
+            if initial_offset is not None:
+                try:
+                    file.seek(initial_offset)
+                except OSError:
+                    file = factory.get_binary_file()
+            else:
+                file = factory.get_binary_file()
         else:
             return factory
 

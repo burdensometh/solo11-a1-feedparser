@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+Note:         The XML declaration is honored even though text/xml implies us-ascii
+Header:       Content-type: text/xml
+Description: XML declaration encoding is used even though text/xml implies us-ascii
+Expect:      not bozo and encoding == 'utf-8'
+-->
+
+<feed version="0.3" xmlns="http://purl.org/atom/ns#">
+  <title>Iñtërnâtiônàlizætiøn</title>
+</feed>
