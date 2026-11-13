@@ -239,6 +239,69 @@ Feed :abbr:`URL (Uniform Resource Locator)` as default base :abbr:`URI (Uniform 
     'http://example.org/archives/000001.html'
 
 
+The ``<base>`` element
+~~~~~~~~~~~~~~~~~~~~~~
+
+Embedded :abbr:`HTML (HyperText Markup Language)` markup may declare a base
+:abbr:`URI (Uniform Resource Identifier)` with a ``<base href="...">`` element.
+When it does, it takes precedence over the feed's :abbr:`URL (Uniform Resource Locator)`
+and any xml:base that is in effect for the element containing the markup.
+A relative ``href`` is itself resolved against that base.
+
+..  code-block:: pycon
+
+    >>> import feedparser
+    >>> d = feedparser.parse(feed_text)
+    >>> d.entries[0].content[0].value
+    '<base href="http://cdn.example.org/images/" /><img src="http://cdn.example.org/images/logo.png" />'
+
+If the ``<base>`` element declares an ``href`` that is not an
+:abbr:`HTTP (Hypertext Transfer Protocol)` or
+:abbr:`HTTPS (HTTP Secure)` :abbr:`URL (Uniform Resource Locator)` -- for
+example a ``javascript:`` :abbr:`URI (Uniform Resource Identifier)` -- it is
+ignored and the feed's default base continues to be used.
+
+
+.. _advanced.base.discarded:
+
+Which Completed :abbr:`URI (Uniform Resource Identifier)`\s Are Discarded
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Only ``http`` and ``https`` :abbr:`URI (Uniform Resource Identifier)`\s are
+produced when a relative reference is completed.  A reference that would be
+completed to another protocol is discarded (it becomes an empty string) and
+counted in ``discarded_uris`` on the parse result.  Absolute references,
+such as ``mailto:`` or ``tag:`` :abbr:`URI (Uniform Resource Identifier)`\s,
+are not completed and are left unchanged.
+
+A relative reference is also left unchanged when there is no base
+:abbr:`URI (Uniform Resource Identifier)` to complete it with -- for
+example, when the feed was parsed from a string and no ``Content-Location``
+header was supplied.
+
+
+.. _advanced.base.original:
+
+Original Relative References
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Completing a relative reference replaces it in the parsed data.  The original
+text is still available in the ``relative_uris`` mapping on the parse result,
+which maps each completed :abbr:`URI (Uniform Resource Identifier)` back to the
+relative reference the feed contained.
+
+..  code-block:: pycon
+
+    >>> import feedparser
+    >>> d = feedparser.parse(feed_text)
+    >>> d.entries[0].content[0].value
+    '<img src="http://example.org/archives/logo.png" />'
+    >>> d.relative_uris["http://example.org/archives/logo.png"]
+    'logo.png'
+    >>> d.discarded_uris
+    0
+
+
 .. _advanced.base.disable:
 
 Disabling Relative :abbr:`URI (Uniform Resource Identifier)`\s Resolution

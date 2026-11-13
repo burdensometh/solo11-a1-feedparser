@@ -29,7 +29,6 @@
 import copy
 
 from ..datetimes import _parse_date
-from ..urls import make_safe_absolute_uri
 from ..util import FeedParserDict
 
 
@@ -483,6 +482,7 @@ class Namespace:
 
     def _start_enclosure(self, attrs_d):
         attrs_d = self._enforce_href(attrs_d)
+        attrs_d = self.resolve_uri_attributes(attrs_d, "href")
         context = self._get_context()
         attrs_d["rel"] = "enclosure"
         context.setdefault("links", []).append(FeedParserDict(attrs_d))
@@ -490,7 +490,7 @@ class Namespace:
     def _start_source(self, attrs_d):
         if "url" in attrs_d:
             # This means that we're processing a source element from an RSS 2.0 feed
-            self.sourcedata["href"] = attrs_d["url"]
+            self.sourcedata["href"] = self.resolve_uri(attrs_d["url"])
         self.push("source", 1)
         self.insource = 1
         self.title_depth = -1
@@ -508,7 +508,7 @@ class Namespace:
         self.push_content("content", attrs_d, "text/plain", 1)
         src = attrs_d.get("src")
         if src:
-            self.contentparams["src"] = src
+            self.contentparams["src"] = self.resolve_uri(src)
         self.push("content", 1)
 
     def _start_body(self, attrs_d):
@@ -544,4 +544,4 @@ class Namespace:
         # don't set newlocation if the context isn't right
         if context is not self.feeddata:
             return
-        context["newlocation"] = make_safe_absolute_uri(self.baseuri, url.strip())
+        context["newlocation"] = self.resolve_uri(url.strip())

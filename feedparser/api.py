@@ -361,6 +361,7 @@ def _parse_file_inplace(
     if use_json_parser:
         result["version"] = None
         feed_parser = JSONParser(baseuri, baselang, "utf-8")
+        feed_parser.resolve_relative_uris = resolve_relative_uris
         try:
             feed_parser.feed(stream_factory.get_file())
         except Exception as e:
@@ -374,3 +375,13 @@ def _parse_file_inplace(
         result["namespaces"] = {}
     else:
         result["namespaces"] = feed_parser.namespaces_in_use
+
+    # Relative URI completion bookkeeping: how many references were dropped
+    # because they did not produce an HTTP(S) URI, and what the original
+    # relative text was for each completed URI.
+    uri_tracker = getattr(feed_parser, "uri_tracker", None)
+    if uri_tracker is not None:
+        result["discarded_uris"] = uri_tracker.discarded_uris
+        # A plain dict: the keys are URIs, not the aliases FeedParserDict
+        # understands.
+        result["relative_uris"] = dict(uri_tracker.relative_uris)

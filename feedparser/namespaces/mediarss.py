@@ -117,11 +117,13 @@ class Namespace:
     def _start_media_content(self, attrs_d):
         context = self._get_context()
         context.setdefault("media_content", [])
+        self.resolve_uri_attributes(attrs_d, "url")
         context["media_content"].append(attrs_d)
 
     def _start_media_thumbnail(self, attrs_d):
         context = self._get_context()
         context.setdefault("media_thumbnail", [])
+        self.resolve_uri_attributes(attrs_d, "url")
         self.push("url", 1)  # new
         context["media_thumbnail"].append(attrs_d)
 
@@ -133,6 +135,7 @@ class Namespace:
                 context["media_thumbnail"][-1]["url"] = url
 
     def _start_media_player(self, attrs_d):
+        self.resolve_uri_attributes(attrs_d, "url")
         self.push("media_player", 0)
         self._get_context()["media_player"] = FeedParserDict(attrs_d)
 

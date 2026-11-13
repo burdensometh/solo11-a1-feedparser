@@ -35,7 +35,13 @@ import xml.sax.saxutils
 from .html import _cp1252
 from .namespaces import _base, cc, dc, georss, itunes, mediarss, psc
 from .sanitizer import HTMLSanitizer, sanitize_html
-from .urls import _urljoin, make_safe_absolute_uri, resolve_relative_uris
+from .urls import (
+    URITracker,
+    _urljoin,
+    make_safe_absolute_uri,
+    resolve_relative_uris,
+    resolve_uri_reference,
+)
 from .util import FeedParserDict
 
 email_pattern = re.compile(
@@ -179,6 +185,8 @@ class XMLParserMixin(
         self.namespaces_in_use = {}  # dictionary of namespaces defined by the feed
         self.resolve_relative_uris = False
         self.sanitize_html = False
+        # Bookkeeping for completed relative URI references.
+        self.uri_tracker = URITracker()
 
         # the following are used internally to track state;
         # this is really out of control and should be refactored
@@ -462,7 +470,21 @@ class XMLParserMixin(
             self.namespaces_in_use[prefix or ""] = uri
 
     def resolve_uri(self, uri):
-        return _urljoin(self.baseuri or "", uri)
+        return resolve_uri_reference(self.baseuri or "", uri, self.uri_tracker)
+
+    def resolve_uri_attributes(self, attrs_d, *keys):
+        """Complete the URI references in *attrs_d* for the given *keys*.
+
+        Attributes such as ``url``, ``href`` or ``src`` hold the same kind of
+        reference as the URI-valued elements handled by :meth:`resolve_uri`,
+        so they follow the same rules.
+        """
+
+        for key in keys:
+            value = attrs_d.get(key)
+            if isinstance(value, str) and value.strip():
+                attrs_d[key] = self.resolve_uri(value)
+        return attrs_d
 
     @staticmethod
     def decode_entities(element, data):
@@ -573,6 +595,7 @@ class XMLParserMixin(
                     self.baseuri,
                     self.encoding,
                     self.contentparams.get("type", "text/html"),
+                    self.uri_tracker,
                 )
 
         # sanitize embedded markup

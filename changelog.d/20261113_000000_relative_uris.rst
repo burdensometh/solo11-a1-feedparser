@@ -1,0 +1,20 @@
+Fixed
+-----
+
+*   Complete relative references in feed data and embedded HTML/XHTML
+    markup using the document's ``<base href>`` element when there is one,
+    and the feed's own URL (or its ``xml:base``) otherwise. Relative
+    references used to be left untouched when the feed URL was unknown,
+    and a ``<base href>`` element was ignored entirely.
+
+    Completed references are now restricted to ``http`` and ``https``;
+    references that would resolve to another protocol are discarded, and
+    the number discarded is reported as ``discarded_uris`` on the parse
+    result.
+
+    The original relative text of every completed reference is kept in
+    the new ``relative_uris`` mapping on the parse result.
+
+*   Keep an original relative reference unchanged when there is no base
+    URI to complete it with, instead of returning it unchanged only
+    sometimes (or joining it to an empty string).
